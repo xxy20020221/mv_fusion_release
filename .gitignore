@@ -1,0 +1,30 @@
+# External downloads (see README)
+checkpoints/
+Easy3E/tmp/
+third_party/
+blender_runtime_libs/
+
+# Run outputs written next to the demo inputs
+demo/*/_easy3e_out_*/
+demo/*/_easy3e_work_*/
+demo/*/_state_ablation_eval*/
+demo/*/view_support_comparison/
+demo/*/_render_tmp_*/
+demo/*/_eval/
+demo/*/state_ablation.*
+demo/ninja/source_2.png
+outputs/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Never commit API keys
+.env

@@ -1,0 +1,835 @@
+from typing import *
+from contextlib import contextmanager
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torchvision import transforms
+from PIL import Image
+import rembg
+from .base import Pipeline
+from . import samplers
+from ..modules import sparse as sp
+from torch import Tensor
+from ..utils.general_utils import load_img_features,save_feature,read_feature,merge_coords,export_indexed_coords_to_glb_cubes_colored
+import os
+import torchvision.utils as vutils
+import utils3d
+from ..renderers import OctreeRenderer
+from ..representations.octree import DfsOctree as Octree
+
+class TrellisImageTo3DPipeline(Pipeline):
+    """
+    Pipeline for inferring Trellis image-to-3D models.
+
+    Args:
+        models (dict[str, nn.Module]): The models to use in the pipeline.
+        sparse_structure_sampler (samplers.Sampler): The sampler for the sparse structure.
+        slat_sampler (samplers.Sampler): The sampler for the structured latent.
+        slat_normalization (dict): The normalization parameters for the structured latent.
+        image_cond_model (str): The name of the image conditioning model.
+    """
+    def __init__(
+        self,
+        models: dict[str, nn.Module] = None,
+        sparse_structure_sampler: samplers.Sampler = None,
+        slat_sampler: samplers.Sampler = None,
+        slat_normalization: dict = None,
+        image_cond_model: str = None,
+    ):
+        if models is None:
+            return
+        super().__init__(models)
+        self.sparse_structure_sampler = sparse_structure_sampler
+        self.slat_sampler = slat_sampler
+        self.sparse_structure_sampler_params = {}
+        self.slat_sampler_params = {}
+        self.slat_normalization = slat_normalization
+        self.rembg_session = None
+        self._init_image_cond_model(image_cond_model)
+
+    @staticmethod
+    def from_pretrained(path: str) -> "TrellisImageTo3DPipeline":
+        """
+        Load a pretrained model.
+
+        Args:
+            path (str): The path to the model. Can be either local path or a Hugging Face repository.
+        """
+        pipeline = super(TrellisImageTo3DPipeline, TrellisImageTo3DPipeline).from_pretrained(path)
+        new_pipeline = TrellisImageTo3DPipeline()
+        new_pipeline.__dict__ = pipeline.__dict__
+        args = pipeline._pretrained_args
+
+        new_pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
+        new_pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
+
+        new_pipeline.slat_sampler = getattr(samplers, args['slat_sampler']['name'])(**args['slat_sampler']['args'])
+        new_pipeline.slat_sampler_params = args['slat_sampler']['params']
+
+        new_pipeline.slat_normalization = args['slat_normalization']
+
+        new_pipeline._init_image_cond_model(args['image_cond_model'])
+
+        return new_pipeline
+    
+    def _init_image_cond_model(self, name: str):
+        """
+        Initialize the image conditioning model.
+        """
+        dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
+        dinov2_model.eval()
+        self.models['image_cond_model'] = dinov2_model
+        transform = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self.image_cond_model_transform = transform
+
+    def preprocess_image(self, input: Image.Image) -> Image.Image:
+        """
+        Preprocess the input image.
+        """
+        # if has alpha channel, use it directly; otherwise, remove background
+        has_alpha = False
+        if input.mode == 'RGBA':
+            alpha = np.array(input)[:, :, 3]
+            if not np.all(alpha == 255):
+                has_alpha = True
+        if has_alpha:
+            output = input
+        else:
+            input = input.convert('RGB')
+            max_size = max(input.size)
+            scale = min(1, 1024 / max_size)
+            if scale < 1:
+                input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
+            if getattr(self, 'rembg_session', None) is None:
+                self.rembg_session = rembg.new_session('u2net')
+            output = rembg.remove(input, session=self.rembg_session)
+        output_np = np.array(output)
+        alpha = output_np[:, :, 3]
+        bbox = np.argwhere(alpha > 0.8 * 255)
+        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
+        return self._crop_for_cond(output, bbox)
+
+    @staticmethod
+    def _crop_for_cond(output: Image.Image, bbox) -> Image.Image:
+        """Square crop (1.2x the bbox) -> 518x518, alpha-premultiplied RGB."""
+        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        size = int(size * 1.2)
+        bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
+        output = output.crop(bbox)  # type: ignore
+        output = output.resize((518, 518), Image.Resampling.LANCZOS)
+        output = np.array(output).astype(np.float32) / 255
+        output = output[:, :, :3] * output[:, :, 3:4]
+        output = Image.fromarray((output * 255).astype(np.uint8))
+        return output
+
+    def preprocess_image_pair(self, source: Image.Image, target: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        """Crop a source/target RGBA pair with one shared box (union of both object bboxes).
+
+        preprocess_image crops each image to its own object. When the target adds parts
+        outside the source silhouette (e.g. composing a second object), the two conditions
+        then disagree about the source object's scale and position, and FlowEdit's
+        v_tar - v_src cancels where the new part should appear. Both images must be
+        RGBA in the same pixel frame (same camera and framing).
+        """
+        source, target = source.convert("RGBA"), target.convert("RGBA")
+        if target.size != source.size:
+            target = target.resize(source.size, Image.Resampling.LANCZOS)
+        boxes = []
+        for im in (source, target):
+            ys, xs = np.nonzero(np.array(im)[:, :, 3] > 0.8 * 255)
+            boxes.append((xs.min(), ys.min(), xs.max(), ys.max()))
+        bbox = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+        return self._crop_for_cond(source, bbox), self._crop_for_cond(target, bbox)
+
+    @torch.no_grad()
+    def encode_image(self, image: Union[torch.Tensor, list[Image.Image]]) -> torch.Tensor:
+        """
+        Encode the image.
+
+        Args:
+            image (Union[torch.Tensor, list[Image.Image]]): The image to encode
+
+        Returns:
+            torch.Tensor: The encoded features.
+        """
+        if isinstance(image, torch.Tensor):
+            assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
+        elif isinstance(image, list):
+            assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
+            image = [i.resize((518, 518), Image.LANCZOS) for i in image]
+            image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
+            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
+            image = torch.stack(image).to(self.device)
+        else:
+            raise ValueError(f"Unsupported type of image: {type(image)}")
+        
+        image = self.image_cond_model_transform(image).to(self.device)
+        features = self.models['image_cond_model'](image, is_training=True)['x_prenorm']
+        patchtokens = F.layer_norm(features, features.shape[-1:])
+        return patchtokens
+        
+    def get_cond(self, image: Union[torch.Tensor, list[Image.Image]]) -> dict:
+        """
+        Get the conditioning information for the model.
+
+        Args:
+            image (Union[torch.Tensor, list[Image.Image]]): The image prompts.
+
+        Returns:
+            dict: The conditioning information
+        """
+        cond = self.encode_image(image)
+        neg_cond = torch.zeros_like(cond)
+        return {
+            'cond': cond,
+            'neg_cond': neg_cond,
+        }
+
+    @torch.no_grad()
+    def visualize_sample(self, ss: Union[torch.Tensor, dict]):
+        ss = ss if isinstance(ss, torch.Tensor) else ss['ss']
+        
+        renderer = OctreeRenderer()
+        renderer.rendering_options.resolution = 512
+        renderer.rendering_options.near = 0.8
+        renderer.rendering_options.far = 1.6
+        renderer.rendering_options.bg_color = (0, 0, 0)
+        renderer.rendering_options.ssaa = 4
+        renderer.pipe.primitive = 'voxel'
+        
+        # Build camera
+        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
+        yaws_offset = 0
+        yaws = [y + yaws_offset for y in yaws]
+        pitch = [0.0, 0.0, 0.0, 0.0]
+
+        exts = []
+        ints = []
+        for yaw, pitch in zip(yaws, pitch):
+            orig = torch.tensor([
+                np.sin(yaw) * np.cos(pitch),
+                np.cos(yaw) * np.cos(pitch),
+                np.sin(pitch),
+            ]).float().cuda() * 2
+            fov = torch.deg2rad(torch.tensor(30)).cuda()
+            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
+            intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
+            exts.append(extrinsics)
+            ints.append(intrinsics)
+
+        images = []
+        
+        # Build each representation
+        ss = ss.cuda()
+        for i in range(ss.shape[0]):
+            representation = Octree(
+                depth=10,
+                aabb=[-0.5, -0.5, -0.5, 1, 1, 1],
+                device='cuda',
+                primitive='voxel',
+                sh_degree=0,
+                primitive_config={'solid': True},
+            )
+            coords = torch.nonzero(ss[i, 0], as_tuple=False)
+            representation.position = coords.float() / 64
+            representation.depth = torch.full((representation.position.shape[0], 1), int(np.log2(64)), dtype=torch.uint8, device='cuda')
+
+            image = torch.zeros(3, 1024, 1024).cuda()
+            tile = [2, 2]
+            for j, (ext, intr) in enumerate(zip(exts, ints)):
+                res = renderer.render(representation, ext, intr, colors_overwrite=representation.position)
+                image[:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = res['color']
+            images.append(image)
+            
+        return torch.stack(images)
+       
+    def sample_sparse_structure(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        sampler_params: dict = {},
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Sample sparse structures with the given conditioning.
+        
+        Args:
+            cond (dict): The conditioning information.
+            num_samples (int): The number of samples to generate.
+            sampler_params (dict): Additional parameters for the sampler.
+        """
+        # Sample occupancy latent
+        flow_model = self.models['sparse_structure_flow_model']
+        reso = flow_model.resolution
+        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        if kwargs.get("mode","baseline") =="flowedit":
+            latent=kwargs["latent"]
+            sample_result = self.sparse_structure_sampler.sample(
+            flow_model,
+            latent,
+            **cond,
+            **sampler_params,
+            **kwargs,
+            verbose=True
+            )
+            z_s = sample_result.samples
+            # Stash the sample_result so flowedit() can retrieve auxiliary outputs
+            # attached by the sampler (e.g. quiescent_mask, mask_metrics).
+            self._last_flowedit_sample_result = sample_result
+            decoder = self.models['sparse_structure_decoder']
+            coords1 = torch.argwhere(decoder(z_s)>0)[:, [0, 2, 3, 4]].int()
+            enable_step_viz = bool(kwargs.get("enable_step_viz", False))
+            if enable_step_viz:
+                feature_dir = os.path.dirname(kwargs["feature_path"])
+                save_dir = os.path.join(feature_dir, "sparse_structure_steps_glb")
+                os.makedirs(save_dir, exist_ok=True)
+
+                every = max(1, int(kwargs.get("step_viz_every", 5)))
+                decoded_source = decoder(latent.to(self.device)) > 0
+                coords_source = torch.argwhere(decoded_source)[:, [0, 2, 3, 4]].int()
+                source_path = os.path.join(save_dir, "sparse_step_000_source.glb")
+                export_indexed_coords_to_glb_cubes_colored(
+                    coords_source,
+                    source_path,
+                    color_rgba=[160, 160, 160, 180],
+                )
+                print(f"[STEP_VIZ] Exported source sparse latent to {source_path}")
+
+                step_latents = list(getattr(sample_result, "pred_x_t", []) or [])
+                selected_steps = {
+                    i for i in range(len(step_latents))
+                    if ((i + 1) % every == 0) or (i == len(step_latents) - 1)
+                }
+                for step_i in sorted(selected_steps):
+                    z_step = step_latents[step_i].to(self.device)
+                    decoded_step = decoder(z_step) > 0
+                    coords_step = torch.argwhere(decoded_step)[:, [0, 2, 3, 4]].int()
+                    out_path = os.path.join(
+                        save_dir,
+                        f"sparse_step_{step_i + 1:03d}_of_{len(step_latents):03d}.glb",
+                    )
+                    export_indexed_coords_to_glb_cubes_colored(
+                        coords_step,
+                        out_path,
+                        color_rgba=[80, 180, 255, 180],
+                    )
+                    print(f"[STEP_VIZ] Exported sparse latent step {step_i + 1}/{len(step_latents)} to {out_path}")
+            return coords1
+        else:
+            noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
+            
+            z_s = self.sparse_structure_sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **sampler_params,
+            **kwargs,
+            verbose=True
+            ).samples
+            decoder = self.models['sparse_structure_decoder']
+            coords1 = torch.argwhere(decoder(z_s)>0)[:, [0, 2, 3, 4]].int()
+            if kwargs.get("use_latent", False):
+                features = load_img_features(kwargs["feature_path"])
+                device = self.device
+                feature_dir = os.path.dirname(kwargs["feature_path"])
+                parent_dir = os.path.dirname(feature_dir)
+                save_dir = os.path.join(parent_dir, "visualize_latent1")
+                os.makedirs(save_dir, exist_ok=True)
+                for k, z_s in features.items():
+                    z_s = z_s.to(self.device)
+                    # print(z_s.shape)
+   
+                    decoded = decoder(z_s) > 0  
+                    resolution = decoded.shape[-1]
+                    coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()  # [batch_idx, z, y, x]
+                    # print("coords")
+                    # print(coords.shape)
+                    if k=="0.1111111111111112_img":
+                        ori_coords=coords
+                    voxel_tensor = torch.zeros((z_s.shape[0], 1, resolution, resolution, resolution), dtype=torch.float32, device=device)
+    
+                    for b in range(z_s.shape[0]):
+                        batch_coords = coords[coords[:, 0] == b][:, 1:]  # Get voxel coords for this batch
+                        voxel_tensor[b, 0, batch_coords[:, 0], batch_coords[:, 1], batch_coords[:, 2]] = 1.0
+    
+                    images = self.visualize_sample(voxel_tensor)
+
+                    for idx, img in enumerate(images):
+        # If batch > 1, save as k_0.png, k_1.png ...
+                        name = f"{k}_{idx}.png" if z_s.shape[0] > 1 else f"{k}.png"
+                        vutils.save_image(img, os.path.join(save_dir, name))
+                coords = torch.argwhere(kwargs["ori_mask"])[:, [0, 2, 3, 4]].int()  # [batch_idx, z, y, x]
+                #print("coords")
+                #print(coords.shape)
+                coords_union = torch.cat([coords, ori_coords], dim=0)
+                coords_union = torch.unique(coords_union, dim=0)
+                coords = coords_union
+                voxel_tensor = torch.zeros((z_s.shape[0], 1, resolution, resolution, resolution), dtype=torch.float32, device=device)
+    
+                for b in range(z_s.shape[0]):
+                    batch_coords = coords[coords[:, 0] == b][:, 1:]  # Get voxel coords for this batch
+                    voxel_tensor[b, 0, batch_coords[:, 0], batch_coords[:, 1], batch_coords[:, 2]] = 1.0
+    
+                images = self.visualize_sample(voxel_tensor)
+
+                for idx, img in enumerate(images):
+        # If batch > 1, save as k_0.png, k_1.png ...
+                    name = f"mask.png" if z_s.shape[0] > 1 else f"mask.png"
+                    vutils.save_image(img, os.path.join(save_dir, name))
+            return coords1
+
+    def decode_slat(
+        self,
+        slat: sp.SparseTensor,
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+    ) -> dict:
+        """
+        Decode the structured latent.
+
+        Args:
+            slat (sp.SparseTensor): The structured latent.
+            formats (List[str]): The formats to decode the structured latent to.
+
+        Returns:
+            dict: The decoded structured latent.
+        """
+        ret = {}
+        if 'mesh' in formats:
+            ret['mesh'] = self.models['slat_decoder_mesh'](slat)
+        if 'gaussian' in formats:
+            ret['gaussian'] = self.models['slat_decoder_gs'](slat)
+        if 'radiance_field' in formats:
+            ret['radiance_field'] = self.models['slat_decoder_rf'](slat)
+        return ret
+    
+    def sample_slat(
+        self,
+        cond: dict,
+        coords: torch.Tensor,
+        sampler_params: dict = {},
+        **kwargs,
+    ) -> sp.SparseTensor:
+        """
+        Sample structured latent with the given conditioning.
+        
+        Args:
+            cond (dict): The conditioning information.
+            coords (torch.Tensor): The coordinates of the sparse structure.
+            sampler_params (dict): Additional parameters for the sampler.
+
+        kwargs:
+            - mode: "baseline" | "repaint". In repaint mode, uses SLAT repainting formula.
+            - latent_slat (SparseTensor, optional): Source SLAT (unnormalized) for repaint mode.
+            - mask (Tensor, optional): 3D raw_mask [B,1,64,64,64] for repaint mode (1=editable region).
+        """
+        # Sample structured latent
+        flow_model = self.models['slat_flow_model']
+        sampler_params = {**self.slat_sampler_params, **sampler_params}
+
+        std = torch.tensor(self.slat_normalization['std'])[None].to(self.device)
+        mean = torch.tensor(self.slat_normalization['mean'])[None].to(self.device)
+
+        mode = kwargs.get("mode", "baseline")
+
+        if mode == "repaint":
+            # === SLAT Repainting: non-editable region uses forward analytical noising of source, no inversion needed ===
+            latent_slat = kwargs["latent_slat"]
+            # Normalize to model training domain
+            x_src = (latent_slat - mean) / std
+
+            # Initial noise: pure Gaussian aligned with coords, SparseTensor
+            noise = sp.SparseTensor(
+                feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
+                coords=coords,
+            )
+
+            # Align source latent to target coords (keep only rows in coords, fill missing positions with 0).
+            # For simplicity, assume the caller has set coords to source coords in the repaint stage (holds in typical slat editing scenarios).
+            # Caller must ensure: x_src.coords are aligned to coords in the same order; otherwise _mask_blend will handle SparseTensor coordinate differences.
+            repaint_kwargs = dict(kwargs)
+            repaint_kwargs["mode"] = "repaint"
+            repaint_kwargs["x_src"] = x_src
+            # kwargs["mask"] is already raw_mask [B,1,64,64,64], pass through directly
+            slat = self.slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                **repaint_kwargs,
+                verbose=True
+            ).samples
+            slat = slat * std + mean
+        else:
+            # baseline: generate from pure noise
+            noise = sp.SparseTensor(
+                feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
+                coords=coords,
+            )
+            slat = self.slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                **kwargs,
+                verbose=True
+            ).samples
+            slat = slat * std + mean
+        return slat
+    
+    @torch.no_grad()
+    def flowedit(
+        self,
+        ori_image: Image.Image,
+        image: Image.Image,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        latent: Optional[Tensor] = None,
+        latent_slat: Optional[Tensor] = None,
+        coords: Optional[Tensor] = None,
+        feature_path: Optional[str] = None,
+        latent_mask: Optional[Tensor] = None,
+        raw_mask: Optional[Tensor] = None,
+        preprocess_image: bool = True,
+        edit_mask:  Optional[Tensor] = None,
+        cfg_src_strength: float = 5.0,
+        cfg_tar_strength: float = 5.0,
+        flowedit_lambda: float = 0.5,
+        mask_feather_outward: bool = False,
+        pair_crop: bool = False,
+        enable_step_viz: bool = False,
+        step_viz_every: int = 5,
+        use_guidance: bool = True,
+        azimuth_deg: float = 270.0,
+        debug_guidance_viz: bool = False,
+        mv_velocity_debug: Optional[dict] = None,
+        mv_fusion: Optional[dict] = None,
+    ):
+        """
+        Full editing pipeline: first edit sparse structure voxels with FlowEdit, then edit SLAT with Repainting.
+        The entire process shares the same raw_mask (3D voxel mask, [B,1,64,64,64], 1=editable region).
+
+        Additional tunable parameters:
+            cfg_src_strength: Source condition CFG strength in FlowEdit (default 5.0)
+            cfg_tar_strength: Target condition CFG strength in FlowEdit (default 5.0)
+            flowedit_lambda:  Source velocity coefficient in FlowEdit: v_target - lambda * v_src (default 0.5).
+            enable_step_viz:  Whether to export per-step 4-view visualization of FlowEdit (default False, for speed)
+            step_viz_every:  Export one sparse-structure GLB every N FlowEdit steps when enable_step_viz is true.
+            use_guidance:     Whether to enable orthographic silhouette guidance (default True)
+            azimuth_deg:      Camera azimuth angle in degrees for guidance projection (default 270.0 = front view 012.png).
+                              Automatically determined from the ori/ folder filename.
+            debug_guidance_viz: Whether to save debug visualization of guidance alignment (default False).
+                              Saves side-by-side images of [silhouette | edit_mask | overlay] to feature/guidance_debug/.
+        """
+        torch.manual_seed(seed)
+        pair_crop = pair_crop or (bool(mv_fusion.get("pair_crop", False)) if mv_fusion is not None else False)
+        if preprocess_image:
+            if pair_crop:
+                ori_image, image = self.preprocess_image_pair(ori_image, image)
+            else:
+                ori_image = self.preprocess_image(ori_image)
+                image = self.preprocess_image(image)
+        ori_cond = cond = self.encode_image([ori_image])
+        cond = self.get_cond([image])
+
+        if mv_velocity_debug is not None:
+            source_images = mv_velocity_debug.get("source_images", [])
+            target_images = mv_velocity_debug.get("target_images", [])
+            if preprocess_image:
+                source_images = [self.preprocess_image(img) for img in source_images]
+                target_images = [self.preprocess_image(img) for img in target_images]
+            mv_velocity_debug = dict(mv_velocity_debug)
+            mv_velocity_debug["source_cond"] = self.get_cond(source_images)
+            mv_velocity_debug["target_cond"] = self.get_cond(target_images)
+
+        if mv_fusion is not None:
+            source_images = mv_fusion.get("source_images", [])
+            target_images = mv_fusion.get("target_images", [])
+            if preprocess_image and pair_crop:
+                pairs = [self.preprocess_image_pair(s, t) for s, t in zip(source_images, target_images)]
+                source_images, target_images = [p[0] for p in pairs], [p[1] for p in pairs]
+            elif preprocess_image:
+                source_images = [self.preprocess_image(img) for img in source_images]
+                target_images = [self.preprocess_image(img) for img in target_images]
+            mv_fusion = dict(mv_fusion)
+            mv_fusion["source_cond"] = self.get_cond(source_images)
+            mv_fusion["target_cond"] = self.get_cond(target_images)
+
+        # ===== Stage 1: sparse structure - FlowEdit =====
+        kwargs = {}
+        kwargs["mode"] = "flowedit"
+        kwargs["latent"] = latent
+        kwargs["latent_slat"] = latent_slat
+        kwargs["feature_path"] = os.path.join(feature_path, "feature_flowedit_test.pkl")
+        kwargs["edit_mask"] = edit_mask
+        # Pass CFG / guidance / visualization switches to sampler
+        kwargs["cfg_src_strength"] = cfg_src_strength
+        kwargs["cfg_tar_strength"] = cfg_tar_strength
+        kwargs["flowedit_lambda"] = flowedit_lambda
+        kwargs["mask_feather_outward"] = mask_feather_outward
+        kwargs["use_guidance"] = use_guidance
+        kwargs["enable_step_viz"] = enable_step_viz
+        kwargs["step_viz_every"] = step_viz_every
+        kwargs["azimuth_deg"] = azimuth_deg
+        kwargs["debug_guidance_viz"] = debug_guidance_viz
+        kwargs["debug_viz_dir"] = os.path.join(os.path.dirname(feature_path), "guidance_debug") if debug_guidance_viz else None
+        kwargs["mv_velocity_debug"] = mv_velocity_debug
+        kwargs["mv_fusion"] = mv_fusion
+        if latent_mask is not None:
+            kwargs["mask"] = latent_mask
+            kwargs["use_mask"] = True
+            kwargs["ori_mask"] = raw_mask
+        else:
+            kwargs["use_mask"] = False
+        kwargs["stage"] = "sparse"
+        kwargs["ori_cond"] = ori_cond
+        kwargs["decode_voxel_fn"] = self.models['sparse_structure_decoder']
+        coords1 = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params, **kwargs)
+
+        # Persist the edited sparse-structure latent so a later round can start from it
+        # (x_s^{r+1} <- x_edit^r) instead of re-encoding the decoded geometry.
+        _last_res = getattr(self, "_last_flowedit_sample_result", None)
+        if _last_res is not None and getattr(_last_res, "samples", None) is not None:
+            os.makedirs(feature_path, exist_ok=True)
+            torch.save(_last_res.samples.detach(), os.path.join(feature_path, "ss_latent_edited.pt"))
+
+        # ---- Quiescent-region shrinkage (mv_fusion only) ----
+        # The sampler may have detected a set of voxels inside mask_all whose multi-view
+        # velocities are both consistent AND small-magnitude (i.e. the network agrees
+        # "no meaningful edit needed" here). We remove them from raw_mask so that
+        # (a) merge_coords keeps the source's voxels there, and (b) the SLAT repaint
+        # stage blends towards source for these voxels -- effectively falling back to
+        # the source mesh in the quiescent region.
+        raw_mask_for_slat = raw_mask
+        quiescent_mask_from_sampler = None
+        _last_res = getattr(self, "_last_flowedit_sample_result", None)
+        if _last_res is not None:
+            quiescent_mask_from_sampler = getattr(_last_res, "quiescent_mask", None)
+        if quiescent_mask_from_sampler is not None and raw_mask is not None:
+            try:
+                q_dev = quiescent_mask_from_sampler.to(device=raw_mask.device)
+                if q_dev.shape != raw_mask.shape:
+                    print(
+                        f"[MV_FUSION_QUIESCENT][WARN] quiescent_mask shape {tuple(q_dev.shape)} != "
+                        f"raw_mask shape {tuple(raw_mask.shape)}; skip raw_mask shrinkage."
+                    )
+                else:
+                    if mv_fusion is not None and mv_fusion.get("state_mode") == "three_state_srcocc":
+                        # Source-stable U only: keep voxels the source does not occupy editable.
+                        src_occ = torch.zeros_like(q_dev)
+                        c = latent_slat.coords.long().to(q_dev.device)
+                        src_occ[c[:, 0], 0, c[:, 1], c[:, 2], c[:, 3]] = True
+                        print(f"[MV_FUSION_QUIESCENT] three_state_srcocc: {int((q_dev & ~src_occ).sum())} quiescent "
+                              f"voxels unoccupied in the source stay editable.")
+                        q_dev = q_dev & src_occ
+                    raw_mask_for_slat = raw_mask.clone()
+                    # Wherever quiescent==True: force raw_mask to 0 (outside editable region).
+                    raw_mask_for_slat[q_dev] = 0
+                    num_removed = int(q_dev.sum().item())
+                    num_before  = int((raw_mask > 0).sum().item())
+                    num_after   = int((raw_mask_for_slat > 0).sum().item())
+                    print(
+                        f"[MV_FUSION_QUIESCENT] SLAT raw_mask shrunk by {num_removed} quiescent voxels "
+                        f"({num_before} -> {num_after} editable voxels remain)."
+                    )
+            except Exception as e:
+                print(f"[MV_FUSION_QUIESCENT][WARN] Failed to shrink raw_mask with quiescent set: {e}")
+                raw_mask_for_slat = raw_mask
+
+        # Merge newly generated coords1 with source coords by raw_mask: use new coords inside mask, keep source coords outside
+        coords_combined = merge_coords(
+            coords1,
+            latent_slat.coords,
+            raw_mask_for_slat,
+            device=self.device,
+            hole_fill_radius=0
+        )
+
+        # ===== Stage 2: slat - Repainting =====
+        kwargs["decode_voxel_fn"] = None
+        kwargs["stage"] = "slat"
+        kwargs["mask"] = raw_mask_for_slat
+        kwargs["mode"] = "repaint"
+        kwargs["latent_slat"] = latent_slat
+        slat = self.sample_slat(cond, coords_combined, slat_sampler_params, **kwargs)
+
+        # Export visualization
+        os.makedirs(feature_path, exist_ok=True)
+        export_indexed_coords_to_glb_cubes_colored(latent_slat.coords, os.path.join(feature_path, "vox_ori.glb"), slat_feat=latent_slat.feats)
+        export_indexed_coords_to_glb_cubes_colored(coords_combined, os.path.join(feature_path, "vox_edit.glb"), slat_feat=slat.feats)
+
+        # ---- Method D: persist the FINAL edited SLAT (unnormalized) to disk ----
+        # Save so that a subsequent round (e.g. round-2 mv_fusion) can reuse
+        # this SLAT directly as its z_src, skipping the lossy re-encoder path
+        # (render 150 views -> dinov2 -> sparse-conv encoder). This makes the
+        # round-2 SLAT z_src *byte-identical* to round-1's decoder input in
+        # mask-outside regions.
+        try:
+            slat_edited_path = os.path.join(feature_path, "slat_edited.pt")
+            torch.save({
+                "feats":  slat.feats.detach().cpu(),
+                "coords": slat.coords.detach().cpu(),
+            }, slat_edited_path)
+            print(f"[SLAT_REUSE] Saved final edited SLAT to {slat_edited_path} "
+                  f"(feats={tuple(slat.feats.shape)}, coords={tuple(slat.coords.shape)})")
+        except Exception as _e:
+            print(f"[SLAT_REUSE][WARN] Failed to save slat_edited.pt: {_e}")
+
+        return self.decode_slat(slat, formats)
+
+    @torch.no_grad()
+    def run(
+        self,
+        image: Image.Image,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        preprocess_image: bool = True,
+        latent_slat: Optional[sp.SparseTensor] = None,
+        mask: Optional[Tensor] = None,
+    ) -> dict:
+        """
+        Run the pipeline.
+
+        Two modes:
+          1) Normal generation: do not pass latent_slat / mask -> generate sparse structure and slat from pure noise
+          2) SLAT Repainting: pass latent_slat (source SLAT) + mask (3D raw_mask, [B,1,64,64,64], 1=editable region)
+             -> sparse structure is generated from pure noise (no editing), slat stage uses SLAT repainting formula:
+                z_{k-1} = M ⊙ [z_k + Δt v_θ(z_k, t_k | cond)] + (1-M) ⊙ [(1-t_{k-1}) z^src + t_{k-1} ε_k]
+
+        Args:
+            image (Image.Image): Target image condition I^tgt
+            latent_slat (sp.SparseTensor, optional): Source SLAT (unnormalized), z^src for repainting
+            mask (Tensor, optional): 3D raw_mask, [B,1,64,64,64], value 1 = editable region
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            image = self.preprocess_image(image)
+        cond = self.get_cond([image])
+        torch.manual_seed(seed)
+
+        do_repaint = (latent_slat is not None) and (mask is not None)
+
+        # ===== Stage 1: sparse structure =====
+        # No sparse editing, baseline generation; if coords need to be constrained later, caller can use latent_slat.coords
+        kwargs_ss = {"mode": "baseline", "stage": "sparse"}
+        coords1 = self.sample_sparse_structure(
+            cond, num_samples, sparse_structure_sampler_params, **kwargs_ss
+        )
+
+        # ===== Stage 2: slat =====
+        if do_repaint:
+            # slat repaint: use source latent_slat's coords so they align with x_src
+            coords_slat = latent_slat.coords.to(self.device)
+            kwargs_slat = {
+                "mode": "repaint",
+                "stage": "slat",
+                "latent_slat": latent_slat,
+                "mask": mask,
+            }
+            slat = self.sample_slat(cond, coords_slat, slat_sampler_params, **kwargs_slat)
+        else:
+            kwargs_slat = {"mode": "baseline", "stage": "slat"}
+            slat = self.sample_slat(cond, coords1, slat_sampler_params, **kwargs_slat)
+
+        return self.decode_slat(slat, formats)
+
+    @contextmanager
+    def inject_sampler_multi_image(
+        self,
+        sampler_name: str,
+        num_images: int,
+        num_steps: int,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+    ):
+        """
+        Inject a sampler with multiple images as condition.
+        
+        Args:
+            sampler_name (str): The name of the sampler to inject.
+            num_images (int): The number of images to condition on.
+            num_steps (int): The number of steps to run the sampler for.
+        """
+        sampler = getattr(self, sampler_name)
+        setattr(sampler, f'_old_inference_model', sampler._inference_model)
+
+        if mode == 'stochastic':
+            if num_images > num_steps:
+                print(f"\033[93mWarning: number of conditioning images is greater than number of steps for {sampler_name}. "
+                    "This may lead to performance degradation.\033[0m")
+
+            cond_indices = (np.arange(num_steps) % num_images).tolist()
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                cond_idx = cond_indices.pop(0)
+                cond_i = cond[cond_idx:cond_idx+1]
+                return self._old_inference_model(model, x_t, t, cond=cond_i, **kwargs)
+        
+        elif mode =='multidiffusion':
+            from .samplers import FlowEulerSampler
+            def _new_inference_model(self, model, x_t, t, cond, neg_cond, cfg_strength, cfg_interval, **kwargs):
+                if cfg_interval[0] <= t <= cfg_interval[1]:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    neg_pred = FlowEulerSampler._inference_model(self, model, x_t, t, neg_cond, **kwargs)
+                    return (1 + cfg_strength) * pred - cfg_strength * neg_pred
+                else:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    return pred
+            
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+            
+        sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
+
+        yield
+
+        sampler._inference_model = sampler._old_inference_model
+        delattr(sampler, f'_old_inference_model')
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        preprocess_image: bool = True,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition
+
+        Args:
+            images (List[Image.Image]): The multi-view images of the assets
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            images = [self.preprocess_image(image) for image in images]
+        cond = self.get_cond(images)
+        cond['neg_cond'] = cond['neg_cond'][:1]
+        torch.manual_seed(seed)
+        ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
+            slat = self.sample_slat(cond, coords, slat_sampler_params)
+        return self.decode_slat(slat, formats)
